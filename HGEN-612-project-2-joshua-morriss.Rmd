@@ -1,0 +1,804 @@
+---
+title: "Urinary Cachexia Index - A metabolomic tool to assess presence or severity"
+author: "Joshua Morriss"
+date: "5/11/2021"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    logo: images/favicon_urine_medium.png
+    favicon: images/favicon_cachexia.png
+    theme: cosmo
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup and data prep, include = FALSE}
+
+# Libraries
+library(tidymodels)     # for building my models
+library(shiny)          # for the shiny web app
+library(shinyWidgets)   # for custom shiny components
+library(shinyjs)        # for javascript operations
+library(readr)          # for importing data
+library(vip)            # for variable importance plots
+library(viridis)        # for cool colors B^]
+library(janitor)        # for clean names and tabyl
+library(randomForest)   # for the random forest model
+library(pROC)           # for obtaining the ROC of my models
+library(ggplot2)        # for detailed plots ("grammar of graphics")
+library(GGally)         # an extension to ggplot, adds functionalities
+library(rsample)        # to split the data into training and testing
+library(DT)             # for data tables
+library(ranger)         # for the randomForest() functions
+library(rsconnect)      # to upload the shinyapp to shinyapp.io
+
+# Modeling objective: With urine metabolites obtained from either healthy volunteers or patients with cancer, the objective was to classify those patients with the presence or absence of cachexia (muscle loss with/without fat loss).
+
+# Import data
+data_raw <- 
+  read_csv('https://raw.githubusercontent.com/joshuamorriss/metabolomics-r-us/main/human_cachexia.csv')
+# Priot to analysis, the data were cleaned. Metabolites that had : criteria = 70% MV with threshold below 30 (peak concentration of metabolome, not area) were imputed.
+
+# Convert muscle loss grouping into a factor
+data_work = data_raw
+data_work$`Muscle loss` <- as.factor(data_raw$`Muscle loss`) # Mark the transition from raw data to data that is being modified (or "worked")
+
+# Get the response variables and clean their names
+response_vars<-colnames(clean_names(data_work[1:3]))
+names(data_work)[1:3]<-make_clean_names(colnames(data_work[1:3]))
+
+# Simplify the name of Levoglucosan
+
+data_work <- data_work %>% rename(Levoglucosan = `1,6-Anhydro-beta-D-glucose`)
+
+# Find the severity of cachexia as and determine time points from the data
+
+data_work <-
+  data_work %>% mutate(
+    # Coalesce on NA's with the cachexia severity, replacing NA's degree of muscule gain/loss.
+    time_1 = ifelse(grepl("V1", patient_id, ), '0_days', NA),
+    # Some baselines do not have a post (100_days), possibly due to patient drop out (failure to follow-up), death, etc
+    time_2 = ifelse(grepl("V2", patient_id), '100_days', NA),
+    time_3 = ifelse(grepl("PIF", patient_id), '0_days', NA),
+    # This was a one-time visit, muscle status was collected from visits outside of trial
+    time_points = coalesce(time_1, time_2, time_3)
+  ) %>% select(
+    -muscle_loss_per_100_days,
+    -time_1,
+    -time_2,
+    -time_3
+  )
+
+# Reorder the data so it's easier to interpret
+data_work <- data_work %>% relocate(time_points, .after = muscle_loss)
+
+data_work$time_points <- as.factor(data_work$time_points) # Predictor with a factor attribute
+# The binary outcome of "control" and "cachexia" are the primary outcome the user can explore.
+
+analyte_names <- colnames(data_work) # To change the colnames of the normalized data back, without the "X" artifact from log.
+
+# colnames(norm_data) <- analyte_names
+
+```
+
+
+Sidebar {.sidebar}
+===========================================================
+
+<br>
+<br>
+
+`r h3("Objective:")`
+`r h3("Predict the absence or presence of cachexia by changes in the urine metabolome.")`
+`r h4("The outcome is binary (muscle_loss).")`
+
+- - -
+
+<br>
+
+```{r, shiny.inputs}
+
+normalize_select_choices <- as.character(c(
+    "step_normalize & step_center",
+    "log2_transform & pareto_scale",
+    "step_normalize & pareto_scale",
+    "log2_transform & step_center"
+  ))
+
+num_trees_possible <- as.numeric(c(5, 10, 20, 50, 100))
+
+useShinyjs(rmd = TRUE)
+
+br()
+
+# br()
+# br()
+
+radioButtons(
+  inputId = "noramlize_selection",
+      label = "Decide how to normalize the data: ",
+  choices = normalize_select_choices
+    )
+
+sliderInput(
+  inputId = "number_of_trees",
+  label   = h4("Select Number of Trees for Random Forest:"),
+  min     = 5,
+  max     = 100,
+  value   = 10,
+  step    = 5,
+  ticks   = FALSE)
+
+br()
+hr()
+br()
+
+
+
+```
+
+```{r data.norm}
+
+# Define the user's input ----
+
+
+normalize_cat <- reactive({
+  as.character(input$noramlize_selection)
+})
+
+num_trees_cat <- reactive({
+  as.numeric(input$number_of_trees)
+})
+
+# Pareto scale function for nomralization ----
+
+paretoscale <- function(data, exclude = T) {
+  if (exclude == T) {
+    # Here we extract numeric data and perform Pareto scaling
+    sample_classes <-
+      data[, 1:4] # Will need to generalize [, 1:3] to exclude character columns - JM 4132021
+    x <-
+      data[, 5:dim(data)[2]] # Will need to generalize [, 1:3] to exclude character columns - JM 4132021
+  } else {
+    sample_classes <- NULL
+    x <- data
+  }
+  # Here we perform centering
+  x.centered <- apply(x, 2, function(x)
+    x - mean(x))
+  # Then we perform scaling on the mean-centered matrix
+  x.sc <- apply(x.centered, 2, function(x)
+    x / sqrt(sd(x)))
+  x.sc <- cbind(sample_classes, x.sc)
+  
+}
+# Credit for pareto scale: https://github.com/cran/RFmarkerDetector/blob/master/R/scaling.R
+
+# Normalize the data depending on user input ----
+
+# Prepare your poor eyes... These nested else if statements are literally the bane
+# of my existence but I cannot for the life of me vectorize these reactive statements,
+# so please forgive me of this absolute sin.
+
+# normalize_cat = "log_2 transform & pareto_scale" # For testing the normalization ifelse statements
+
+data_norm <- reactive({
+  if (normalize_cat() == "step_normalize & step_center") {
+    data_norm = data_work
+  } else if (normalize_cat() == "log2_transform & pareto_scale") {
+    data_norm = data.frame(data_work[, sapply(data_work, class) %in% c('character', 'factor')], (log(data_work[,!sapply(data_work, class) %in% c('character', 'factor')], 2))) # A really round about way of log2 transforming the data
+    data_norm = paretoscale(data_norm)
+    data_norm <-
+      data_norm %>% select_if( ~ sum(!is.na(.)) > 0) # Gets rid of artifacts from pareto scaling, unfortunantely this means that some metabolites will be eliminated...
+  } else if (normalize_cat() == "step_normalize & pareto_scale") {
+    data_norm = paretoscale(data_work)
+    data_norm <-
+      data_norm %>% select_if( ~ sum(!is.na(.)) > 0) # Gets rid of artifacts from pareto scaling, unfortunantely this means that some metabolites will be eliminated...
+  } else {
+    data_norm = data.frame(data_work[, sapply(data_work, class) %in% c('character', 'factor')], (log(data_work[,!sapply(data_work, class) %in% c('character', 'factor')], 2))) # A really round about way of log2 transforming the data
+  }
+}#,names(data_norm)
+)
+
+# names(data_work)
+# data_norm = data_work
+# data_norm$patient_id <
+
+# Subset -select based on which outcome is desired ----
+
+data_final <- reactive({
+    data_final = data_norm() %>% subset(select = -c(patient_id))
+})
+
+# Split the data into training and testing ----
+
+# Create data splits
+set.seed(1337) #for reproducibility
+data_split = reactive({
+  data_final() %>%
+    rsample::initial_split(prop = 0.8)
+})
+
+# pull train set
+set.seed(1337) #for reproducibility
+data_train = reactive({
+training(data_split())
+})
+
+# pull test set
+set.seed(1337) #for reproducibility
+data_test = reactive({
+testing(data_split())
+})
+
+```
+
+```{r, data.recipe}
+
+# Create the 's and Random Forest's recipe ----
+
+data_recipe <-
+  reactive({
+    # If the user selected muscle_loss for outcome_selection
+      if (normalize_cat() == "step_normalize & step_center") {
+        # If the user selected step_normalize & step_center for normalize_selection
+        set.seed(1337) #for reproducibility
+        data_recipe <- data_train() %>%
+          recipe(muscle_loss ~ .) %>%
+          step_normalize(all_numeric()) %>%
+          # step_corr(all_numeric()) %>%
+          step_center(all_numeric()) %>%
+          step_scale(all_numeric()) %>%
+          prep()
+        
+        data_recipe # Prints the recipe
+      } else if (normalize_cat() == "log2_transform & pareto_scale") {
+        # If the user selected log2_transform & pareto_scale for normalize_selection
+        set.seed(1337) #for reproducibility
+        data_recipe <- data_train() %>%
+          recipe(muscle_loss ~ .) %>%
+          # step_corr(all_numeric()) %>%
+          prep()
+        
+        data_recipe # Prints the recipe
+        
+      } else if (normalize_cat() == "step_normalize & pareto_scale") {
+        # If the user selected step_normalize & pareto_scale for normalize_selection
+        set.seed(1337) #for reproducibility
+        data_recipe <- data_train() %>%
+          recipe(muscle_loss ~ .) %>%
+          step_normalize(all_numeric()) %>%
+          # step_corr(all_numeric()) %>%
+          prep()
+        
+        data_recipe # Prints the recipe
+      } else {
+        # If the user selected log2_transform & step_center for normalize_selection
+        set.seed(1337) #for reproducibility
+        data_recipe <- data_train() %>%
+          recipe(muscle_loss ~ .) %>%
+          # step_corr(all_numeric()) %>%
+          step_center(all_numeric()) %>%
+          step_scale(all_numeric()) %>%
+          prep()
+        
+        data_recipe # Prints the recipe
+        
+      }
+      
+  })
+
+# Redefine the outcome as a binomial for the , 
+
+```
+
+
+```{r create.model}
+set.seed(1337) #for reproducibility
+rf_mod = reactive({
+  rand_forest(trees = as.numeric(num_trees_cat()), mode = "classification") %>% set_engine("ranger", importance = "impurity")
+})
+
+# rf_mod
+
+```
+
+```{r create.workflow}
+
+rf_workflow <- reactive({
+  workflow() %>% add_model(rf_mod()) %>%
+    add_recipe(data_recipe())
+})
+
+```
+
+
+```{r fit.training with RF}
+set.seed(1337) #for reproducibility
+rf_fit <- reactive({
+  rf_workflow() %>%
+    fit(data = data_train()) # This is where the formula breaks down
+})
+
+# Perform 10-fold Cross Validation ----
+
+K_fold_CV <- reactive({
+  kfolds<-rsample::vfold_cv(data_train, v = 10)
+})  
+
+rf_validation <- reactive({
+  fit_resamples(rf_workflow(), K_fold_CV())
+})
+
+```
+
+
+```{r, roc.plot, eval = TRUE}
+rf_probs <- reactive({
+  rf_fit() %>%
+    predict(data_test(), type = "prob") %>%
+    bind_cols(data_test())
+})
+
+```
+
+Study Description
+===========================================================
+
+## Column {data-width="500"}
+
+<br>
+<br>
+
+### Figure 1
+
+![Figure 1. Cartoon rendition of a person suffering from cachexia. Available at BioRender: https://biorender.com/icon/human-anatomy/human-figure/body-adult-male-cachexia/.](./images/Cachexia.png)
+
+## Column {data-width="1000"}
+
+<br>
+<br>
+
+### Purpose of this analysis
+
+The purpose of this shiny app was to determine the absence or presence
+of cachexia in patients with cancer by using the urinary metabolome. 
+Cachexia is defined as muscle loss with or without fat loss, and is
+due to chronic diseases like cancer. 
+Treatment options for cachexia includes nutritional counseling and
+medications to stimulate appetite and weight gain
+(such as dronabinol and the steroid, dexamethasone). 
+Since this analysis focuses 
+specifically on metabolic processes 
+involved with muscle formation or loss,
+it makes sense to examine any disruptions 
+to the downstream metabolites of these hypertrophic processes.
+
+How we currently assess cachexia is expensive and labor intensive.
+Computed tomography (CT) and magnetic resonance
+imaging (MRI) are considered the most precise measures of
+adipose and muscle tissues, however these techniques must be repeated
+over time to detect loss and some have suggested concern for exposing
+patients to radiation in CT scans.
+
+Using the urinary metabolome to determine a person's
+cachexia status may offer a timely and safe way to 
+better manage cachexia, and intervene in high-risk 
+populations such as those with cancer.
+
+### Using this ShinyApp
+
+On the side bar, the user can select how to **normalize** the data as well
+as modifying the random forest model by choosing the **number of trees**
+to use.
+
+Since random forest is a supervised machine learning algorith, we may select
+the **number of trees** varying from 5 to 100, by increments of 5.
+These "trees" are essentially randomly created decision trees. Each node in the 
+decision tree works on a random subset of features to calculate the output. 
+After the trees are made, the RF combines the output of individual decision trees 
+to generate the final output.
+
+There is **1 factor predictor**, `time_points`, that is separated into
+either 0_days or 100_days. Some patients returned after 100 days to determine
+their cachexia status, while others already had their status previously
+calculated from 100 days outside of this trial.
+
+In the case of determining cachexia presence, **muscle_loss** is used.
+
+Lastly, metabolomic data are often highly variable and do not adhere
+to the central limit theorem. In order to perform machine learning
+models to classify patients, and compare which metabolites are
+most important to the models, the data must be normalized.
+The user can choose from one of 4 possible normalization techniques
+to normalize the data. The **log_2** function was from 
+base R, and transforms the data by a base of 2.
+One custom function, **pareto_scale**, has been written
+to scale the data. Should the user not choose these two, 
+they may choose the **step_normalize** and
+**step_center** functions inherent to the `recipies` library.
+Additionally, the user may choose any combination of the 4 to
+transform and scale the data.
+
+### Skim of the data, including metabolites
+
+```{r skim of data}
+
+skimr::skim(data_work)
+
+```
+
+Data Summaries - Highest Abundance
+===========================================================
+
+## Column {data-width="500"}
+
+<br>
+<br>
+
+### Pairwise Plots for metabolites with highest abunance
+
+```{r data summary most, message=FALSE}
+
+data_labels <-
+  data_work[, 1:4] # Get the factors and categorical numerics from the data
+data_abundance <-
+  data_work[, !colnames(data_work) %in% colnames(data_labels)] # Drop the data_labels
+
+most_abundant <-
+  data_abundance %>% gather(key, value) %>% group_by(key) %>% summarise(Sums = sum(value)) %>% arrange(desc(Sums)) %>% top_n(4, Sums) # Determine the most abundant metabolite species from the column sums
+
+data_abundance <-
+  data_work[, colnames(data_work) %in% most_abundant$key] # Subset the most abundant metabolites from the data
+most_abundant <-
+  cbind(data_labels, data_abundance) # Combine the two dataframes
+
+outcome_cat <- reactive({as.character(input$outcome_selection)})
+
+# Create a ggpairs plot with the most abundant metabolite species
+output$most_abund_plot <- renderPlot({
+    GGally::ggpairs(
+      data = most_abundant,
+      columns = c(5:length(most_abundant)),
+      mapping = ggplot2::aes(color = muscle_loss),
+      lower = list(continuous = wrap("smooth", alpha = 0.3)),
+      upper = list(continuous = wrap(
+        ggally_cor, size = 5, color = "black"
+      ))
+    ) + theme(
+      # Make the plot more aesthetically pleasing
+      axis.text = element_text(size = 15),
+      axis.title = element_text(size = 15),
+      legend.background = element_rect(fill = "white"),
+      panel.grid.major = element_line(colour = NA),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "grey95")
+    )
+})
+    
+plotOutput(outputId = "most_abund_plot")
+
+# print(
+#   most_abund_plot,
+#   bottomHeightProportion = 0.5,
+#   leftWidthProportion = 0.5
+# )
+
+```
+
+
+Data Summaries - Lowest Abundance
+===========================================================
+
+## Column {data-width="500"}
+
+<br>
+<br>
+
+### Pairwise Plots for metabolites with lowest abunance
+
+```{r data summary least}
+
+# Duplicating the next 2 lines just in case someone later wants to delete the Most abundant chunk, and vice versa
+data_labels <-
+  data_work[, 1:4] # Get the factors and categorical numerics from the data
+data_abundance <-
+  data_work[, !colnames(data_work) %in% colnames(data_labels)] # Drop the data_labels
+
+least_abundant <-
+  data_abundance %>% gather(key, value) %>% group_by(key) %>% summarise(Sums = sum(value)) %>% arrange(desc(Sums)) %>% top_n(4,-Sums) # Determine the least abundant metabolite species from the column sums
+
+data_abundance <-
+  data_work[, colnames(data_work) %in% least_abundant$key] # Subset the least abundant metabolites from the data
+least_abundant <-
+  cbind(data_labels, data_abundance) # Combine the two dataframes
+
+# The commented ggscactmat below is commented, as I chose to use the ggpairs plot instead : JMM 05102021 ----
+
+# least_abundant %>%
+#   GGally::ggscatmat(
+#     columns = 6:15,
+#     color = "cachexia_status",
+#     alpha = 1,
+#     corMethod = "spearman"
+#   ) +
+#   ggsci::scale_color_jco() +
+#   ggpubr::theme_pubclean() +
+#   theme(
+#     strip.background = element_blank(),
+#     legend.position = "right",
+#     legend.key = element_blank()
+#   )
+
+# Create a ggpairs plot with the least abundant metabolite species
+
+outcome_cat <- reactive({as.character(input$outcome_selection)})
+
+output$least_abund_plot <- renderPlot({
+    GGally::ggpairs(
+      data = least_abundant,
+      columns = c(5:length(least_abundant)),
+      mapping = ggplot2::aes(color = muscle_loss),
+      lower = list(continuous = wrap("smooth", alpha = 0.3)),
+      upper = list(continuous = wrap(
+        ggally_cor, size = 5, color = "black"
+      ))
+    ) + theme(
+      # Make the plot more aesthetically pleasing
+      axis.text = element_text(size = 15),
+      axis.title = element_text(size = 15),
+      legend.background = element_rect(fill = "white"),
+      panel.grid.major = element_line(colour = NA),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "grey95")
+    )
+})
+    
+plotOutput(outputId = "least_abund_plot")
+
+# print(
+#   least_abund_plot,
+#   bottomHeightProportion = 0.5,
+#   leftWidthProportion = 0.5
+# )
+
+```
+
+
+Workflow Summary
+===========================================================
+
+
+## Column {data-width="500"}
+
+<br>
+<br>
+
+### Data Splitting
+
+**Total Observations:**  
+`r dim(data_work)[1]`
+
+**Training Set:**  
+`r reactive({dim(data_train())[1]})`
+
+**Testing Set:**  
+`r reactive({dim(data_test())[1]})`
+
+
+### Data Viewer (before normalization)
+
+```{r}
+data_work %>% 
+  slice(1:100) %>% 
+  datatable(options = list(searching = FALSE,
+                           pageLength = 50,
+                           lengthMenu = c(50, 100)),
+            style = "bootstrap")
+
+```
+
+## Column {data-width="500"}
+
+<br>
+<br>
+
+### Recipe for Random Forest
+
+```{r}
+
+renderPrint(data_recipe())
+
+```
+
+### Workflow: Random Forest
+
+```{r}
+
+# renderPrint(lr_workflow_best())
+
+renderPrint(rf_workflow())
+
+```
+
+Model Performance
+===========================================================
+
+## Column {data-width="500"}
+
+<br>
+<br>
+
+### Evaluation of Model
+
+```{r, plot roc.plot, eval = TRUE}
+
+# renderPrint(rf_probs())
+
+output$rf_roc_plot <- renderPlot({
+    rf_probs() %>%
+      roc_curve(muscle_loss, .pred_cachexic) %>% autoplot()
+})
+
+ plotOutput(outputId = "rf_roc_plot")
+ 
+ ### CV Plot(s): Random Forest
+
+
+```
+
+### Confusion Matrix 
+
+```{r, k.fold.val and conf.mat.rf}
+
+# Perform 10-fold Cross Validation ----
+
+K_fold_CV <-reactive({rsample::vfold_cv(data_train(), v = 10)})
+
+rf_last_fit <- reactive({last_fit(rf_workflow(), data_split())})
+
+# Confusion matrix ----
+
+conf_mat_rf <- reactive({
+  rf_last_fit() %>%
+    collect_predictions() %>%
+    conf_mat(truth = "muscle_loss", estimate = .pred_class)
+})
+
+```
+
+
+```{r, conf.mat.rf.plot}
+
+output$conf_mat_rf_plot <- renderPlot({
+  conf_mat_rf() %>% autoplot("heatmap") + scale_fill_distiller(palette = "GnBu") + theme(
+    axis.text = element_text(colour = "black", size = rel(1.1)),
+    title = element_text(colour = "black", size = rel(1.1))
+  )
+})
+
+plotOutput(outputId = "conf_mat_rf_plot")
+
+```
+
+
+## Column {data-width="500"}
+
+<br>
+<br>
+
+### Interpreting the Prediction Metrics
+
+While we typically access the **accuracy** (`accuracy`), **sensitivity** (`sens`)
+and **specificity** (`spec`) of a model to determine its performance, *Random Forests*
+have additional metrics that are used to evaluate their validity as a classifying model.
+
+**Precision** (`precision`) is the number of correctly-identified members of a class divided
+by all the times the model predicted that class. In the case of patients with cachexia, the precision 
+score would be the number of correctly-identified cases of cachexia divided by the total number of times 
+the classifier predicted “cachexia,” rightly or wrongly. **The higher, the better the model.**
+
+**Recall** (`recall`) is the number of members of a class that the classifier identified 
+correctly divided by the total number of members in that class. For cases of cachexia, this would 
+be the number of actual cachexic cases that the classifier correctly identified as such. **The higher,**
+**the better the model.**
+
+
+**F1 score** (`f_meas`) is a little less intuitive because it combines `precision` and `recall` into one metric. 
+If `precision` and `recall` are both high, `f_meas` will be high, too. If they are both low, `f_meas` will be low. 
+If one is high and the other low, `f_meas` will be low. The F1 score is a quick way to tell whether the classifier 
+is actually good at identifying members of a class, or if it is finding shortcuts 
+(e.g., just identifying everything as a member of a large class). **The higher, the better the model.**
+
+Source on interpreting RF prediction metrics: 
+https://medium.com/analytics-vidhya/evaluating-a-random-forest-model-9d165595ad56
+
+### Prediction Metrics: Random Forest
+
+```{r, rf.pred.metrics}
+
+output$metrics_rf <- renderTable({
+  conf_mat_rf() %>%
+    summary() %>%
+    select(-.estimator)
+})
+
+tableOutput(outputId = "metrics_rf")
+
+```
+
+
+
+Cross Validation and VIP Scores
+===========================================================
+
+## Column {data-width="500"} 
+
+<br>
+<br>
+
+### IMPORTANT NOTE FOR THIS SECTION: Runtime and time_points
+
+Updating the chunks in this tab will take anywhere between 30 seconds
+to a minute, due to the number of computations occurring in the
+background. Because any change to the data (by normalization selection)
+or the model parameter (by changing the tree number) affects the initial
+rendering of the model, the cross-validation must also processes these
+changes. The number of figures on this tab has been limited to only the
+cross-validation table and the variable importance in projection (VIP) plot.
+This is to hopefully reduce the time buffering between the user selecting inputs.
+
+Interestingly, the **factor predictor** `time_points` was considered
+an unimportant predictor to this model. It was not until a significant number
+of metabolites were removed from the data set, with only 20 metabolites remaining,
+did `time_points` become significant. Additionally, the data had to be 
+step_normalized and pareto_scaled, with number of trees equal to 10,
+until `time_points` became significant.
+
+To replicate these findings, please use the following data set with this shinyapp:
+https://raw.githubusercontent.com/joshuamorriss/metabolomics-r-us/main/human_cachexia2.csv
+
+And to access the VIP plot confirming these findings, please go to the
+following link: 
+https://github.com/joshuamorriss/metabolomics-r-us/blob/main/time_points_HGEN612_factor_predictor.jpg
+
+### 10-Fold Cross Validation Metrics
+
+
+```{r rf.CV.pred.met}
+
+rf_validation <-
+  reactive({
+    fit_resamples(rf_workflow(), K_fold_CV())
+  })
+
+output$CV_metrics <- renderTable({
+  rf_validation() %>% collect_metrics() %>% select(".metric", "mean", "std_err")
+})
+
+tableOutput(outputId = "CV_metrics")
+
+```
+
+## Column {data-width="500"} 
+
+<br>
+<br>
+
+
+### Variable Importance Plot: Random Forest
+
+```{r, vip.plot.rf}
+
+output$vip_plot_rf <- renderPlot({
+  rf_last_fit() %>%
+    pluck(".workflow", 1) %>%
+    pull_workflow_fit() %>%
+    vip(num_features = 20,
+        aesthetics = list(fill = "purple4")) + theme_light()
+})
+
+plotOutput(outputId = "vip_plot_rf")
+
+```
